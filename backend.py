@@ -15,20 +15,6 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 
-# ══════════════════════════════════════════════════════════════
-#  FAST TRANSLATION STRATEGY
-#  Instead of running 2.3GB model on your slow CPU,
-#  we use FREE online APIs that respond in ~300ms
-#
-#  Priority chain (auto-fallback):
-#  1. MyMemory API     — free, no key, 5000 words/day, ~200ms  ✅
-#  2. LibreTranslate   — free, no key, ~300ms                  ✅
-#  3. Lingva           — free, no key, ~400ms                  ✅
-#  4. Local NLLB model — fallback if all APIs fail             ✅
-#
-#  Result: 200-500ms translation vs 15-30 SECONDS before
-# ══════════════════════════════════════════════════════════════
-
 app = FastAPI(title="Context-Aware Translation API — Fast Mode")
 app.add_middleware(
     CORSMiddleware,
@@ -39,12 +25,6 @@ app.add_middleware(
 
 executor = ThreadPoolExecutor(max_workers=2)
 
-# ══════════════════════════════════════════════════════════════
-#  LANGUAGE CODE MAPPINGS
-#  Each API uses different language codes — we handle all of them
-# ══════════════════════════════════════════════════════════════
-
-# MyMemory uses standard ISO codes
 MYMEMORY_CODES = {
     "english":    "en",
     "hindi":      "hi",
@@ -61,13 +41,9 @@ MYMEMORY_CODES = {
     "italian":    "it",
 }
 
-# LibreTranslate uses same ISO codes
-LIBRE_CODES = MYMEMORY_CODES.copy()
-
-# Lingva uses same ISO codes
+LIBRE_CODES  = MYMEMORY_CODES.copy()
 LINGVA_CODES = MYMEMORY_CODES.copy()
 
-# NLLB local model codes (fallback only)
 NLLB_LANG_CODES = {
     "english":    "eng_Latn",
     "hindi":      "hin_Deva",
@@ -84,9 +60,6 @@ NLLB_LANG_CODES = {
     "italian":    "ita_Latn",
 }
 
-# ══════════════════════════════════════════════════════════════
-#  TRANSLATION CACHE — instant for repeated text
-# ══════════════════════════════════════════════════════════════
 _cache: dict = {}
 MAX_CACHE = 300
 
@@ -102,10 +75,9 @@ def cache_set(k: str, v: str):
             del _cache[old]
     _cache[k] = v
 
-# ══════════════════════════════════════════════════════════════
-#  API 1 — MyMemory (fastest, most reliable, free)
-#  Limit: 5000 words/day without key (add email for 50k/day)
-# ══════════════════════════════════════════════════════════════
+# ── MyMemory API ───────────────────────────────────────────────
+# FIX: Added robust validation to reject bogus results like "EN", "BN"
+# that MyMemory returns when rate-limited or when the language pair fails.
 async def translate_mymemory(text: str, src: str, tgt: str) -> Optional[str]:
     try:
         src_code = MYMEMORY_CODES.get(src, "en")
@@ -122,17 +94,41 @@ async def translate_mymemory(text: str, src: str, tgt: str) -> Optional[str]:
                 if resp.status == 200:
                     data = await resp.json()
                     result = data.get("responseData", {}).get("translatedText", "")
-                    # MyMemory returns error messages in the result sometimes
-                    if result and not result.upper().startswith("MYMEMORY WARNING"):
-                        return result.strip()
+                    response_status = data.get("responseStatus", 0)
+
+                    if not result or result.upper().startswith("MYMEMORY WARNING"):
+                        return None
+
+                    result_stripped = result.strip()
+
+                    # Reject if result is just an ISO language code (e.g. "EN", "BN")
+                    # This is what MyMemory returns when it fails for a language pair
+                    all_codes_upper = {c.upper() for c in MYMEMORY_CODES.values()}
+                    if result_stripped.upper() in all_codes_upper:
+                        print(f"⚠️  MyMemory returned lang code '{result_stripped}' for {src}→{tgt} — skipping")
+                        return None
+
+                    # Reject if result is identical to input (no translation happened)
+                    if result_stripped.lower() == text.strip().lower():
+                        print(f"⚠️  MyMemory returned unchanged text for {src}→{tgt} — skipping")
+                        return None
+
+                    # Reject suspiciously short result for longer input
+                    if len(text.strip()) > 10 and len(result_stripped) <= 3:
+                        print(f"⚠️  MyMemory returned too-short result '{result_stripped}' — skipping")
+                        return None
+
+                    # Reject non-200 response status from MyMemory
+                    if response_status != 200:
+                        print(f"⚠️  MyMemory bad responseStatus {response_status} for {src}→{tgt} — skipping")
+                        return None
+
+                    return result_stripped
     except Exception as e:
         print(f"⚠️  MyMemory failed: {e}")
     return None
 
-# ══════════════════════════════════════════════════════════════
-#  API 2 — LibreTranslate (free, open source)
-#  Multiple public instances — we try all of them
-# ══════════════════════════════════════════════════════════════
+# ── LibreTranslate ─────────────────────────────────────────────
 LIBRE_INSTANCES = [
     "https://libretranslate.com",
     "https://translate.argosopentech.com",
@@ -169,9 +165,7 @@ async def translate_libre(text: str, src: str, tgt: str) -> Optional[str]:
             continue
     return None
 
-# ══════════════════════════════════════════════════════════════
-#  API 3 — Lingva Translate (Google Translate proxy, free)
-# ══════════════════════════════════════════════════════════════
+# ── Lingva ─────────────────────────────────────────────────────
 LINGVA_INSTANCES = [
     "https://lingva.ml",
     "https://lingva.garudalinux.org",
@@ -202,10 +196,7 @@ async def translate_lingva(text: str, src: str, tgt: str) -> Optional[str]:
             continue
     return None
 
-# ══════════════════════════════════════════════════════════════
-#  LOCAL MODEL FALLBACK — only if ALL APIs fail
-#  Lazy loaded — won't affect startup
-# ══════════════════════════════════════════════════════════════
+# ── Local NLLB fallback ────────────────────────────────────────
 _local_tokenizer = None
 _local_model     = None
 
@@ -247,16 +238,14 @@ def translate_local_sync(text: str, src: str, tgt: str) -> str:
         )
     return tokenizer.batch_decode(outputs, skip_special_tokens=True)[0].strip()
 
-# ══════════════════════════════════════════════════════════════
-#  IDIOM REPLACEMENT + COREFERENCE
-# ══════════════════════════════════════════════════════════════
+# ── Idiom + Coreference ────────────────────────────────────────
 IDIOM_MAP = {
-    "call it a day":      "finish the day's work",
-    "I'm fine":           "I'm fine but emotionally not okay",
-    "under the weather":  "feeling sick",
-    "hit the sack":       "go to sleep",
-    "break a leg":        "good luck",
-    "piece of cake":      "very easy task",
+    "call it a day":          "finish the day's work",
+    "I'm fine":               "I'm fine but emotionally not okay",
+    "under the weather":      "feeling sick",
+    "hit the sack":           "go to sleep",
+    "break a leg":            "good luck",
+    "piece of cake":          "very easy task",
     "costs an arm and a leg": "very expensive",
 }
 
@@ -268,64 +257,49 @@ def replace_idioms(text: str) -> str:
 def resolve_coreference(text: str, context: Optional[List[str]]) -> str:
     if not context: return text
     last = context[-1]
-    if "Rahul" in last:  text = text.replace(" he ", " Rahul ")
+    if "Rahul" in last:   text = text.replace(" he ", " Rahul ")
     if "manager" in last: text = text.replace(" she ", " the manager ")
     return text
 
-# ══════════════════════════════════════════════════════════════
-#  MAIN TRANSLATE FUNCTION — tries APIs in order
-# ══════════════════════════════════════════════════════════════
+# ── Main translate orchestrator ────────────────────────────────
 async def translate_fast(
     text: str,
     src_lang: str,
     tgt_lang: str,
     context: Optional[List[str]] = None
 ) -> tuple[str, str]:
-    """
-    Returns (translated_text, method_used)
-    Tries: cache → MyMemory → LibreTranslate → Lingva → local model
-    """
-    # Pre-process
     text = replace_idioms(text)
     text = resolve_coreference(text, context)
 
-    # Cache check — instant
     ck = cache_key(text, src_lang, tgt_lang)
     cached = cache_get(ck)
     if cached:
         print("⚡ Cache HIT")
         return cached, "cache"
 
-    # Same language — no translation needed
     if src_lang == tgt_lang:
         return text, "passthrough"
 
-    # Try all APIs concurrently for maximum speed
-    # Whichever responds first wins
     print(f"🔄 Translating: {src_lang} → {tgt_lang}")
 
-    # Try MyMemory first (fastest)
     result = await translate_mymemory(text, src_lang, tgt_lang)
     if result:
         cache_set(ck, result)
         print("✅ MyMemory ~200ms")
         return result, "mymemory"
 
-    # Try LibreTranslate
     result = await translate_libre(text, src_lang, tgt_lang)
     if result:
         cache_set(ck, result)
         print("✅ LibreTranslate ~400ms")
         return result, "libretranslate"
 
-    # Try Lingva
     result = await translate_lingva(text, src_lang, tgt_lang)
     if result:
         cache_set(ck, result)
         print("✅ Lingva ~500ms")
         return result, "lingva"
 
-    # Final fallback — local model (slow but always works)
     print("⚠️  All APIs failed — using local model (will be slow)")
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(
@@ -334,9 +308,7 @@ async def translate_fast(
     cache_set(ck, result)
     return result, "local_nllb"
 
-# ══════════════════════════════════════════════════════════════
-#  EMOTION DETECTION — lazy loaded
-# ══════════════════════════════════════════════════════════════
+# ── Emotion detection ──────────────────────────────────────────
 _emotion_classifier = None
 
 def get_emotion():
@@ -384,9 +356,7 @@ def detect_emotion(text: str) -> dict:
                        "fear": 0, "surprise": 0, "neutral": 1}
         }
 
-# ══════════════════════════════════════════════════════════════
-#  WHISPER — audio/video transcription, lazy loaded
-# ══════════════════════════════════════════════════════════════
+# ── Whisper ────────────────────────────────────────────────────
 _whisper = None
 
 def get_whisper():
@@ -398,9 +368,7 @@ def get_whisper():
         print("✅ Whisper tiny loaded")
     return _whisper
 
-# ══════════════════════════════════════════════════════════════
-#  SESSION STORAGE
-# ══════════════════════════════════════════════════════════════
+# ── Session storage ────────────────────────────────────────────
 sessions     = {}
 MAX_SESSIONS = 20
 SESSION_TTL  = 1800
@@ -454,9 +422,7 @@ def get_session(sid: Optional[str]) -> TranslationSession:
     sessions[new_id] = TranslationSession(new_id)
     return sessions[new_id]
 
-# ══════════════════════════════════════════════════════════════
-#  API ENDPOINTS
-# ══════════════════════════════════════════════════════════════
+# ── Endpoints ──────────────────────────────────────────────────
 @app.post("/translate")
 async def translate(
     text:        Optional[str]        = Form(None),
@@ -471,7 +437,6 @@ async def translate(
     trans_time = 0
     session    = get_session(session_id)
 
-    # ── Audio / Video → Text ──────────────────────────────
     if audio or video:
         t0       = time.time()
         uploaded = audio or video
@@ -509,7 +474,6 @@ async def translate(
     ctx     = session.get_context(use_context)
     t1      = time.time()
 
-    # Run translation + emotion IN PARALLEL
     translated_task = translate_fast(text, source_lang, target_lang, ctx)
     emotion_task    = asyncio.get_event_loop().run_in_executor(
         executor, detect_emotion, text
@@ -534,12 +498,12 @@ async def translate(
         "target_lang":       target_lang,
         "context_sentences": ctx,
         "performance": {
-            "transcription_ms":    trans_time,
-            "translation_ms":      translation_ms,
+            "transcription_ms":     trans_time,
+            "translation_ms":       translation_ms,
             "emotion_detection_ms": 0,
-            "total_ms":            total_ms,
-            "method":              method,
-            "cache_size":          len(_cache),
+            "total_ms":             total_ms,
+            "method":               method,
+            "cache_size":           len(_cache),
         },
         "model_info": {
             "name":     f"Fast API ({method})",
@@ -628,11 +592,11 @@ async def health():
             "Lingva (~500ms, free, unlimited)",
             "Local NLLB-600M (fallback, slow)",
         ],
-        "cache_size":    len(_cache),
+        "cache_size":      len(_cache),
         "active_sessions": len(sessions),
         "models_loaded": {
-            "whisper":  _whisper is not None,
-            "emotion":  _emotion_classifier is not None,
+            "whisper":    _whisper is not None,
+            "emotion":    _emotion_classifier is not None,
             "local_nllb": _local_model is not None,
         }
     }
@@ -645,9 +609,6 @@ async def supported_languages():
         "language_codes": MYMEMORY_CODES,
     }
 
-# ══════════════════════════════════════════════════════════════
-#  SERVE FRONTEND
-# ══════════════════════════════════════════════════════════════
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
 FRONTEND_DIST = os.path.join(BASE_DIR, "frontend", "dist")
 
@@ -663,26 +624,12 @@ if os.path.exists(FRONTEND_DIST):
     async def catch_all(full_path: str):
         return FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
 
-# ══════════════════════════════════════════════════════════════
-#  MAIN
-# ══════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     print("\n" + "=" * 65)
     print("⚡ CONTEXT-AWARE TRANSLATOR — FAST API MODE")
     print("=" * 65)
-    print("Translation speed comparison:")
-    print("  OLD (local NLLB on CPU):  15–30 seconds ❌")
-    print("  NEW (MyMemory API):        ~200ms        ✅  150x faster")
-    print("  NEW (LibreTranslate):      ~400ms        ✅")
-    print("  NEW (Lingva):              ~500ms        ✅")
-    print("  Cached text:               0ms           ✅  instant")
-    print()
-    print("All 13 languages supported ✅")
-    print("Emotion detection: local model (loads on first use)")
-    print("Audio/Video: Whisper tiny (loads on first use)")
-    print()
     print(f"📍 http://localhost:{port}")
     print(f"📚 http://localhost:{port}/docs")
     print("=" * 65 + "\n")
