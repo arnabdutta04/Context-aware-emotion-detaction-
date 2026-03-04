@@ -1,8 +1,9 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   Mic, Video, MessageSquare, Brain, Sparkles,
   Upload, Languages, Loader2, Zap, RefreshCw,
-  History, X, Activity, ChevronDown, ArrowRight
+  History, X, Activity, ChevronDown, ArrowRight,
+  Clock, Globe, Trash2, CheckCircle2
 } from 'lucide-react';
 import './styles.css';
 
@@ -31,17 +32,17 @@ const EMOTION_ICONS = {
   fear:'😨', surprise:'😲', disgust:'🤢', neutral:'😐',
 };
 
-// ── Per-mode isolated state — fixes the carry-over bug ──────
 const EMPTY_MODE_STATE = {
-  sourceText:    '',
-  translatedText:'',
-  emotion:       null,
-  perf:          null,
-  mediaURL:      null,
-  mediaType:     null,
-  fileName:      null,
-  context:       [],
-  ctxInfluence:  0,
+  sourceText:'', translatedText:'', emotion:null, perf:null,
+  mediaURL:null, mediaType:null, fileName:null, context:[], ctxInfluence:0,
+};
+
+const GRADIENT_STYLES = {
+  blue:   'radial-gradient(ellipse 80% 60% at 15% 0%, rgba(59,130,246,.18) 0%, transparent 65%), radial-gradient(ellipse 50% 40% at 85% 100%, rgba(99,179,255,.10) 0%, transparent 65%)',
+  purple: 'radial-gradient(ellipse 80% 60% at 15% 0%, rgba(168,85,247,.18) 0%, transparent 65%), radial-gradient(ellipse 50% 40% at 85% 100%, rgba(192,132,252,.10) 0%, transparent 65%)',
+  green:  'radial-gradient(ellipse 80% 60% at 15% 0%, rgba(34,197,94,.18)  0%, transparent 65%), radial-gradient(ellipse 50% 40% at 85% 100%, rgba(74,222,128,.10)  0%, transparent 65%)',
+  red:    'radial-gradient(ellipse 80% 60% at 15% 0%, rgba(239,68,68,.18)  0%, transparent 65%), radial-gradient(ellipse 50% 40% at 85% 100%, rgba(252,165,165,.10)  0%, transparent 65%)',
+  pink:   'radial-gradient(ellipse 80% 60% at 15% 0%, rgba(236,72,153,.18) 0%, transparent 65%), radial-gradient(ellipse 50% 40% at 85% 100%, rgba(249,168,212,.10) 0%, transparent 65%)',
 };
 
 export default function TranslationApp() {
@@ -50,13 +51,17 @@ export default function TranslationApp() {
   const [targetLang, setTarget] = useState('hindi');
   const [useContext, setUseCtx] = useState(false);
   const [loading, setLoading]   = useState(false);
-  const [sessionId, setSessId]  = useState(null);
   const [history, setHistory]   = useState([]);
   const [showHistory, setShowH] = useState(false);
   const [visibleWords, setVW]   = useState(0);
   const [animating, setAnim]    = useState(false);
+  const [toastMsg, setToast]    = useState('');
 
-  // ── Each mode has its OWN isolated state ──────────────────
+  // ── FIX 1: useRef for sessionId — immediately available, never null,
+  // never stale in closures. useState would be null on first translate call.
+  const sessionIdRef = useRef('sess_' + Date.now() + '_' + Math.random().toString(36).slice(2,8));
+  const sessionId = sessionIdRef.current;
+
   const [modeStates, setModeStates] = useState({
     text:    { ...EMPTY_MODE_STATE },
     context: { ...EMPTY_MODE_STATE },
@@ -65,35 +70,43 @@ export default function TranslationApp() {
     emotion: { ...EMPTY_MODE_STATE },
   });
 
-  const cur = modeStates[mode]; // current mode's state
-
-  const setModeField = (field, value) => {
-    setModeStates(prev => ({
-      ...prev,
-      [mode]: { ...prev[mode], [field]: value }
-    }));
-  };
+  const cur = modeStates[mode];
+  const setModeField = (field, value) =>
+    setModeStates(prev => ({ ...prev, [mode]: { ...prev[mode], [field]: value } }));
 
   const fileRef  = useRef(null);
   const timerRef = useRef(null);
 
-  useEffect(() => {
-    setSessId('sess_' + Date.now() + '_' + Math.random().toString(36).slice(2,8));
-  }, []);
-
-  // Reset animation when mode changes
-  useEffect(() => {
-    setAnim(false); setVW(0);
-  }, [mode]);
+  useEffect(() => { setAnim(false); setVW(0); }, [mode]);
 
   // Word-by-word animation
   useEffect(() => {
     if (!animating || !cur.translatedText) return;
     const words = cur.translatedText.split(' ');
     if (visibleWords >= words.length) { setAnim(false); return; }
-    timerRef.current = setTimeout(() => setVW(v => v + 1), 70);
+    timerRef.current = setTimeout(() => setVW(v => v + 1), 55);
     return () => clearTimeout(timerRef.current);
   }, [animating, visibleWords, cur.translatedText]);
+
+  const showToast = (msg) => {
+    setToast(msg);
+    setTimeout(() => setToast(''), 2500);
+  };
+
+  // ── FIX 2: refreshHistory reads from ref, never a stale closure
+  const refreshHistory = useCallback(async () => {
+    const id = sessionIdRef.current;
+    if (!id) return;
+    try {
+      const res  = await fetch(`${API_URL}/session/${id}/history?limit=50`);
+      const data = await res.json();
+      if (Array.isArray(data.history)) {
+        setHistory(data.history);
+      }
+    } catch (err) {
+      console.error('History fetch failed:', err);
+    }
+  }, []);
 
   const handleTranslate = async (file = null) => {
     if (!cur.sourceText && !file) return;
@@ -107,8 +120,11 @@ export default function TranslationApp() {
       const fd = new FormData();
       fd.append('source_lang', sourceLang);
       fd.append('target_lang', targetLang);
-      fd.append('session_id', sessionId);
-      fd.append('use_context', mode === 'context' ? useContext : false);
+      // ── FIX 3: Always send stable ref value — never null
+      fd.append('session_id', sessionIdRef.current);
+      // ── FIX 4: Only context mode sends use_context=true.
+      // This is the correct logic: backend uses session history only when asked.
+      fd.append('use_context', mode === 'context' ? String(useContext) : 'false');
 
       if (file) {
         fd.append(mode === 'audio' ? 'audio' : 'video', file);
@@ -116,28 +132,44 @@ export default function TranslationApp() {
         fd.append('text', cur.sourceText);
       }
 
-      const res  = await fetch(`${API_URL}/translate`, { method:'POST', body:fd });
+      const res  = await fetch(`${API_URL}/translate`, { method: 'POST', body: fd });
       const data = await res.json();
 
-      // Update THIS mode's state only
+      if (data.error) { showToast('⚠️ ' + data.error); return; }
+
+      // ── FIX 5: Context influence uses actual sentences returned by backend.
+      // Backend returns up to 2 context sentences (top_k=2 in get_context()).
+      // So max influence = 2/2 = 100%. This is now accurate, not arbitrary.
+      const ctxSentences  = data.context_sentences || [];
+      const ctxInfluence  = (mode === 'context' && data.context_used && ctxSentences.length > 0)
+        ? Math.min(ctxSentences.length / 2, 1)
+        : 0;
+
       setModeStates(prev => ({
         ...prev,
         [mode]: {
           ...prev[mode],
-          sourceText:    file ? (data.original || '') : prev[mode].sourceText,
+          sourceText:     file ? (data.original || '') : prev[mode].sourceText,
           translatedText: data.translated || '',
-          emotion:       data.emotion || null,
-          perf:          data.performance || null,
-          ctxInfluence:  data.context_used ? (data.context_sentences?.length||0)/3 : 0,
-          context:       (mode==='context' && data.context_used)
-                           ? (data.context_sentences||[])
-                           : prev[mode].context,
+          emotion:        data.emotion    || null,
+          perf:           data.performance || null,
+          ctxInfluence,
+          // ── FIX 6: Store the actual sentences backend used as context.
+          // These are the previous originals fed into the translation.
+          context: (mode === 'context' && ctxSentences.length > 0)
+            ? ctxSentences
+            : prev[mode].context,
         }
       }));
 
       setAnim(true); setVW(0);
+
+      // ── FIX 7: Refresh history — uses ref, no stale closure
+      await refreshHistory();
+
     } catch (err) {
-      console.error(err);
+      console.error('Translation error:', err);
+      showToast('⚠️ Connection failed. Is the backend running?');
     } finally {
       setLoading(false);
     }
@@ -149,7 +181,7 @@ export default function TranslationApp() {
     const url = URL.createObjectURL(file);
     setModeStates(prev => ({
       ...prev,
-      [mode]: { ...prev[mode], mediaURL:url, mediaType:mode, fileName:file.name }
+      [mode]: { ...prev[mode], mediaURL: url, mediaType: mode, fileName: file.name }
     }));
     handleTranslate(file);
   };
@@ -157,9 +189,8 @@ export default function TranslationApp() {
   const handleRefresh = async () => {
     if (!window.confirm('Clear all translations and start fresh?')) return;
     const fd = new FormData();
-    fd.append('session_id', sessionId);
-    await fetch(`${API_URL}/session/clear`, { method:'POST', body:fd }).catch(()=>{});
-    // Reset ALL mode states
+    fd.append('session_id', sessionIdRef.current);
+    await fetch(`${API_URL}/session/clear`, { method: 'POST', body: fd }).catch(() => {});
     setModeStates({
       text:    { ...EMPTY_MODE_STATE },
       context: { ...EMPTY_MODE_STATE },
@@ -167,25 +198,34 @@ export default function TranslationApp() {
       video:   { ...EMPTY_MODE_STATE },
       emotion: { ...EMPTY_MODE_STATE },
     });
-    setHistory([]); setShowH(false);
+    setHistory([]);
+    setShowH(false);
+    showToast('✅ Session cleared');
   };
 
+  // ── FIX 8: loadHistory fetches fresh data before opening modal
   const loadHistory = async () => {
-    try {
-      const res  = await fetch(`${API_URL}/session/${sessionId}/history?limit=20`);
-      const data = await res.json();
-      if (data.history?.length > 0) { setHistory(data.history); setShowH(true); }
-      else alert('No history yet. Start translating!');
-    } catch { alert('Failed to load history'); }
+    await refreshHistory();
+    setShowH(true);
   };
 
   const currentMode = MODES.find(m => m.id === mode);
-  const words = cur.translatedText.split(' ');
+  const words = cur.translatedText ? cur.translatedText.split(' ') : [];
 
   return (
     <div className="app">
       <div className="bg-grid" />
-      <div className={`bg-glow glow-${currentMode.color}`} />
+      <div
+        className="bg-glow"
+        style={{ background: GRADIENT_STYLES[currentMode.color], transition: 'background 0.6s ease' }}
+      />
+
+      {/* ── TOAST NOTIFICATION ── */}
+      {toastMsg && (
+        <div className="toast">
+          <CheckCircle2 size={14}/> {toastMsg}
+        </div>
+      )}
 
       <div className="wrap">
         {/* ── HEADER ── */}
@@ -195,17 +235,21 @@ export default function TranslationApp() {
               <Languages size={20} />
             </div>
             <div>
-              <h1 className="logo-title">LinguaContext</h1>
-              <p className="logo-sub">Context-Aware Neural Translation</p>
+              <h1 className="logo-title">Context-Aware Translation and emotion Detaction </h1>
+              <p className="logo-sub">AI Translation</p>
             </div>
           </div>
           <div className="header-right">
             <div className="session-pill">
               <span className="session-live" />
-              <span>{sessionId?.slice(0,16)}…</span>
+              <span>{sessionId.slice(0, 16)}…</span>
             </div>
             <button onClick={loadHistory} className="hdr-btn">
-              <History size={14}/> History
+              <History size={14}/>
+              History
+              {history.length > 0 && (
+                <span className="hist-count-badge">{history.length}</span>
+              )}
             </button>
             <button onClick={handleRefresh} className="hdr-btn hdr-btn-red">
               <RefreshCw size={14}/> Reset
@@ -222,7 +266,7 @@ export default function TranslationApp() {
               <button
                 key={m.id}
                 onClick={() => setMode(m.id)}
-                className={`tab tab-${m.color} ${active ? 'tab-active' : ''}`}
+                className={`tab tab-${m.color} ${active ? `tab-active tab-active-${m.color}` : ''}`}
               >
                 <Icon size={15} />
                 <span className="tab-main">{m.label}</span>
@@ -234,7 +278,6 @@ export default function TranslationApp() {
 
         {/* ── MAIN GRID ── */}
         <div className="grid">
-
           {/* LEFT — Input */}
           <div className={`card card-${currentMode.color}`}>
             <div className="card-top">
@@ -253,7 +296,7 @@ export default function TranslationApp() {
                 onClear={() => {
                   setModeStates(prev => ({
                     ...prev,
-                    [mode]: { ...prev[mode], mediaURL:null, mediaType:null, fileName:null }
+                    [mode]: { ...prev[mode], mediaURL: null, mediaType: null, fileName: null }
                   }));
                   if (fileRef.current) fileRef.current.value = '';
                 }}
@@ -265,10 +308,11 @@ export default function TranslationApp() {
                 value={cur.sourceText}
                 onChange={e => setModeField('sourceText', e.target.value)}
                 placeholder="Enter text to translate…"
-                onKeyDown={e => { if (e.key==='Enter' && e.ctrlKey) handleTranslate(); }}
+                onKeyDown={e => { if (e.key === 'Enter' && e.ctrlKey) handleTranslate(); }}
               />
             )}
 
+            {/* ── CONTEXT TOGGLE ── */}
             {mode === 'context' && (
               <label className="ctx-toggle">
                 <input
@@ -278,14 +322,21 @@ export default function TranslationApp() {
                   className="ctx-cb"
                 />
                 <span className="ctx-track" />
-                <span className="ctx-label">Use conversation context</span>
+                <div className="ctx-label-wrap">
+                  <span className="ctx-label">Use conversation context</span>
+                  <span className="ctx-hint">
+                    {useContext
+                      ? '✅ Uses last 2 translations to improve accuracy'
+                      : '⚪ Each translation is independent'}
+                  </span>
+                </div>
               </label>
             )}
 
             <button
               className={`translate-btn btn-${currentMode.color}`}
               onClick={() => handleTranslate()}
-              disabled={loading || (!cur.sourceText && mode!=='audio' && mode!=='video')}
+              disabled={loading || (!cur.sourceText && mode !== 'audio' && mode !== 'video')}
             >
               {loading
                 ? <><Loader2 size={17} className="spin"/> Processing…</>
@@ -293,8 +344,7 @@ export default function TranslationApp() {
               }
             </button>
 
-            {/* Transcribed text */}
-            {(mode==='audio'||mode==='video') && cur.sourceText && (
+            {(mode === 'audio' || mode === 'video') && cur.sourceText && (
               <div className="transcribed">
                 <span className={`transcribed-label label-${currentMode.color}`}>
                   Transcribed Text
@@ -303,17 +353,26 @@ export default function TranslationApp() {
               </div>
             )}
 
-            {/* Context list */}
-            {mode==='context' && (
+            {/* ── CONTEXT PANEL ── */}
+            {mode === 'context' && (
               <div className="ctx-panel">
                 <div className="ctx-head">
-                  <span>Context ({cur.context.length})</span>
+                  <span>Context used ({cur.context.length} sentence{cur.context.length !== 1 ? 's' : ''})</span>
                   <button className="xs-btn" onClick={() => setModeField('context', [])}>Clear</button>
                 </div>
-                {cur.context.length===0
-                  ? <p className="muted">No context yet — start translating!</p>
-                  : cur.context.map((c,i) => <div key={i} className="ctx-item">{c}</div>)
-                }
+                {cur.context.length === 0 ? (
+                  <p className="muted">
+                    {useContext
+                      ? 'No context yet — translate something first!'
+                      : 'Enable the toggle above to use conversation history.'}
+                  </p>
+                ) : (
+                  cur.context.map((c, i) => (
+                    <div key={i} className="ctx-item">
+                      <span className="ctx-item-num">#{i + 1}</span> {c}
+                    </div>
+                  ))
+                )}
               </div>
             )}
           </div>
@@ -325,14 +384,13 @@ export default function TranslationApp() {
               <LangSelect value={targetLang} onChange={setTarget} color={currentMode.color} />
             </div>
 
-            {/* Media player on output side */}
-            {(mode==='audio'||mode==='video') && cur.mediaURL && (
+            {(mode === 'audio' || mode === 'video') && cur.mediaURL && (
               <div className={`media-out media-out-${currentMode.color}`}>
                 <div className="media-out-head">
-                  <span>{mode==='video'?'🎬':'🎤'} {mode==='video'?'Video':'Audio'} Source</span>
+                  <span>{mode === 'video' ? '🎬' : '🎤'} {mode === 'video' ? 'Video' : 'Audio'} Source</span>
                   <span className="media-fname">{cur.fileName}</span>
                 </div>
-                {mode==='video'
+                {mode === 'video'
                   ? <video src={cur.mediaURL} controls className="media-player-v"/>
                   : <audio src={cur.mediaURL} controls className="media-player-a"/>
                 }
@@ -342,8 +400,14 @@ export default function TranslationApp() {
             <div className={`output-box output-${currentMode.color}`}>
               {cur.translatedText ? (
                 <div className="words">
-                  {words.slice(0, visibleWords).map((w,i) => (
-                    <span key={i} className={`word word-${currentMode.color}`}>{w} </span>
+                  {words.slice(0, visibleWords).map((w, i) => (
+                    <span
+                      key={i}
+                      className={`word word-${currentMode.color}`}
+                      style={{ animationDelay: `${i * 0.03}s` }}
+                    >
+                      {w}{' '}
+                    </span>
                   ))}
                   {animating && visibleWords < words.length && (
                     <span className={`caret caret-${currentMode.color}`}/>
@@ -357,29 +421,66 @@ export default function TranslationApp() {
               )}
             </div>
 
-            {/* Context influence */}
+            {/* ── CONTEXT INFLUENCE BAR ── */}
             {cur.ctxInfluence > 0 && (
               <div className="influence">
                 <div className="influence-head">
                   <span>Context Influence</span>
-                  <strong>{Math.round(cur.ctxInfluence*100)}%</strong>
+                  <strong>{Math.round(cur.ctxInfluence * 100)}%</strong>
                 </div>
                 <div className="influence-track">
-                  <div className={`influence-fill fill-purple`}
-                    style={{width:`${cur.ctxInfluence*100}%`}}>
+                  <div className="influence-fill fill-purple" style={{ width: `${cur.ctxInfluence * 100}%` }}>
                     <div className="shimmer"/>
                   </div>
+                </div>
+                <div className="influence-note">
+                  Used {Math.round(cur.ctxInfluence * 2)} previous sentence{cur.ctxInfluence * 2 !== 1 ? 's' : ''} as context
                 </div>
               </div>
             )}
 
-            {/* Performance */}
-            {cur.perf && <PerfCard perf={cur.perf} color={currentMode.color}/>}
-
-            {/* Emotion */}
+            {cur.perf    && <PerfCard perf={cur.perf} color={currentMode.color}/>}
             {cur.emotion && <EmotionCard emotion={cur.emotion}/>}
           </div>
         </div>
+
+        {/* ── INLINE HISTORY STRIP ── */}
+        {history.length > 0 && (
+          <div className="history-strip">
+            <div className="history-strip-head">
+              <div className="history-strip-title">
+                <History size={14}/>
+                <span>Recent Translations</span>
+                <span className="hist-strip-count">{history.length} total</span>
+              </div>
+              <button className="xs-btn" onClick={loadHistory}>View All</button>
+            </div>
+            <div className="history-strip-items">
+              {[...history].reverse().slice(0, 3).map((item, i) => (
+                <div key={i} className="hist-strip-item" style={{ animationDelay: `${i * 0.08}s` }}>
+                  <div className="hist-strip-langs">
+                    <Globe size={11}/>
+                    {item.source_lang} → {item.target_lang}
+                    {item.emotion && (
+                      <span
+                        className="hist-strip-emo"
+                        style={{ color: EMOTION_COLORS[item.emotion.emotion] || '#94a3b8' }}
+                      >
+                        {EMOTION_ICONS[item.emotion.emotion] || '😐'}
+                      </span>
+                    )}
+                    <span className="hist-strip-time">
+                      <Clock size={10}/>
+                      {new Date(item.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                    </span>
+                  </div>
+                  <div className="hist-strip-orig">{item.original}</div>
+                  <div className="hist-strip-trans">{item.translated}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         <footer className="footer">
           ⚡ MyMemory · LibreTranslate · Lingva · NLLB-600M fallback &nbsp;|&nbsp;
@@ -387,33 +488,56 @@ export default function TranslationApp() {
         </footer>
       </div>
 
-      {/* History Modal */}
+      {/* ── HISTORY MODAL ── */}
       {showHistory && (
         <div className="overlay" onClick={() => setShowH(false)}>
           <div className="modal" onClick={e => e.stopPropagation()}>
             <div className="modal-head">
-              <h2>Translation History</h2>
-              <button className="modal-close" onClick={() => setShowH(false)}>
-                <X size={15}/>
-              </button>
+              <h2>
+                Translation History
+                <span className="modal-count">{history.length} entries</span>
+              </h2>
+              <div style={{ display: 'flex', gap: '.5rem' }}>
+                <button className="xs-btn xs-btn-red" onClick={handleRefresh} title="Clear all history">
+                  <Trash2 size={12}/> Clear All
+                </button>
+                <button className="modal-close" onClick={() => setShowH(false)}>
+                  <X size={15}/>
+                </button>
+              </div>
             </div>
             <div className="modal-body">
-              {history.length===0
-                ? <p className="muted" style={{textAlign:'center',padding:'2rem'}}>No history yet</p>
-                : [...history].reverse().map((item,i) => (
-                  <div key={i} className="hist-item">
+              {history.length === 0 ? (
+                <div style={{ textAlign: 'center', padding: '3rem 1rem' }}>
+                  <div style={{ fontSize: '3rem', marginBottom: '1rem' }}>🌐</div>
+                  <p className="muted">No history yet. Start translating!</p>
+                </div>
+              ) : (
+                [...history].reverse().map((item, i) => (
+                  <div
+                    key={i}
+                    className="hist-item"
+                    style={{
+                      animationDelay: `${i * 0.04}s`,
+                      borderLeftColor: EMOTION_COLORS[item.emotion?.emotion] || 'var(--blue)'
+                    }}
+                  >
                     <div className="hist-top">
-                      <span className="hist-num">#{history.length-i}</span>
+                      <span className="hist-num">#{history.length - i}</span>
                       <span className="hist-time">
+                        <Clock size={10} style={{ display: 'inline', marginRight: '3px' }}/>
                         {new Date(item.timestamp).toLocaleTimeString()}
                       </span>
-                      <span className="hist-langs">
-                        {item.source_lang} → {item.target_lang}
-                      </span>
+                      <span className="hist-langs">{item.source_lang} → {item.target_lang}</span>
                       {item.emotion && (
-                        <span className="hist-emo"
-                          style={{color:EMOTION_COLORS[item.emotion.emotion]||'#94a3b8'}}>
-                          {EMOTION_ICONS[item.emotion.emotion]||'😐'} {item.emotion.emotion}
+                        <span
+                          className="hist-emo"
+                          style={{ color: EMOTION_COLORS[item.emotion.emotion] || '#94a3b8' }}
+                        >
+                          {EMOTION_ICONS[item.emotion.emotion] || '😐'} {item.emotion.emotion}
+                          <span style={{ opacity: .6, marginLeft: '3px' }}>
+                            ({(item.emotion.confidence * 100).toFixed(0)}%)
+                          </span>
                         </span>
                       )}
                     </div>
@@ -421,7 +545,7 @@ export default function TranslationApp() {
                     <div className="hist-trans">{item.translated}</div>
                   </div>
                 ))
-              }
+              )}
             </div>
           </div>
         </div>
@@ -430,7 +554,7 @@ export default function TranslationApp() {
   );
 }
 
-// ── Sub-components ──────────────────────────────────────────
+/* ── Sub-components ── */
 
 function LangSelect({ value, onChange, color }) {
   return (
@@ -441,9 +565,7 @@ function LangSelect({ value, onChange, color }) {
         onChange={e => onChange(e.target.value)}
       >
         {LANGUAGES.map(l => (
-          <option key={l} value={l}>
-            {l.charAt(0).toUpperCase()+l.slice(1)}
-          </option>
+          <option key={l} value={l}>{l.charAt(0).toUpperCase() + l.slice(1)}</option>
         ))}
       </select>
       <ChevronDown size={12} className="lang-chev"/>
@@ -462,7 +584,7 @@ function FileZone({ mode, mediaURL, mediaType, fileName, fileRef, onFile, onClea
               <X size={11}/> Remove
             </button>
           </div>
-          {mediaType==='video'
+          {mediaType === 'video'
             ? <video src={mediaURL} controls className="media-player-v"/>
             : <audio src={mediaURL} controls className="media-player-a"/>
           }
@@ -471,23 +593,19 @@ function FileZone({ mode, mediaURL, mediaType, fileName, fileRef, onFile, onClea
           </button>
         </div>
       ) : (
-        <button className={`upload-btn upload-${color}`}
-          onClick={() => fileRef.current?.click()}>
+        <button className={`upload-btn upload-${color}`} onClick={() => fileRef.current?.click()}>
           <Upload size={30} className="upload-icon"/>
-          <span className="upload-main">
-            Click to upload {mode} file
-          </span>
+          <span className="upload-main">Click to upload {mode} file</span>
           <span className="upload-sub">
-            {mode==='audio' ? 'MP3, WAV, M4A, OGG' : 'MP4, MOV, AVI, WebM'}
+            {mode === 'audio' ? 'MP3, WAV, M4A, OGG' : 'MP4, MOV, AVI, WebM'}
           </span>
         </button>
       )}
       <input
-        ref={fileRef}
-        type="file"
-        accept={mode==='audio' ? 'audio/*' : 'video/*'}
+        ref={fileRef} type="file"
+        accept={mode === 'audio' ? 'audio/*' : 'video/*'}
         onChange={onFile}
-        style={{display:'none'}}
+        style={{ display: 'none' }}
       />
     </div>
   );
@@ -496,11 +614,8 @@ function FileZone({ mode, mediaURL, mediaType, fileName, fileRef, onFile, onClea
 function PerfCard({ perf, color }) {
   const method = perf.method || 'api';
   const methodColor = {
-    cache:        '#22c55e',
-    mymemory:     '#3b82f6',
-    libretranslate:'#a855f7',
-    lingva:       '#f59e0b',
-    local_nllb:   '#ef4444',
+    cache: '#22c55e', mymemory: '#3b82f6', libretranslate: '#a855f7',
+    lingva: '#f59e0b', local_nllb: '#ef4444',
   }[method] || '#94a3b8';
 
   return (
@@ -508,7 +623,10 @@ function PerfCard({ perf, color }) {
       <div className="perf-head">
         <Activity size={13}/>
         <span>Performance</span>
-        <span className="method-badge" style={{background:`${methodColor}22`,color:methodColor,border:`1px solid ${methodColor}44`}}>
+        <span
+          className="method-badge"
+          style={{ background: `${methodColor}22`, color: methodColor, border: `1px solid ${methodColor}44` }}
+        >
           {method}
         </span>
       </div>
@@ -525,7 +643,7 @@ function PerfCard({ perf, color }) {
         </div>
         <div className="perf-item">
           <span>Emotion</span>
-          <strong>{perf.emotion_detection_ms?.toFixed(0)||0}ms</strong>
+          <strong>{perf.emotion_detection_ms?.toFixed(0) || 0}ms</strong>
         </div>
         <div className="perf-item perf-total">
           <span>Total</span>
@@ -537,24 +655,20 @@ function PerfCard({ perf, color }) {
 }
 
 function EmotionCard({ emotion }) {
-  const EMOS = ['joy','sadness','anger','fear','surprise','neutral'];
-  const scores = emotion.scores || {};
+  const EMOS = ['joy', 'sadness', 'anger', 'fear', 'surprise', 'neutral'];
+  const scores   = emotion.scores || {};
   const domColor = EMOTION_COLORS[emotion.emotion?.toLowerCase()] || '#94a3b8';
-  const needle = (emotion.confidence * 180) - 90;
+  const needle   = (emotion.confidence * 180) - 90;
 
   return (
     <div className="emo-card">
       <div className="emo-head">
-        <span className="emo-big-icon">
-          {EMOTION_ICONS[emotion.emotion?.toLowerCase()]||'😐'}
-        </span>
+        <span className="emo-big-icon">{EMOTION_ICONS[emotion.emotion?.toLowerCase()] || '😐'}</span>
         <div>
-          <div className="emo-name" style={{color:domColor}}>
+          <div className="emo-name" style={{ color: domColor }}>
             {emotion.emotion?.toUpperCase()}
           </div>
-          <div className="emo-conf">
-            {(emotion.confidence*100).toFixed(1)}% confidence
-          </div>
+          <div className="emo-conf">{(emotion.confidence * 100).toFixed(1)}% confidence</div>
         </div>
       </div>
 
@@ -564,8 +678,8 @@ function EmotionCard({ emotion }) {
             fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth="14" strokeLinecap="round"/>
           <path d="M 20 100 A 80 80 0 0 1 180 100"
             fill="none" stroke={domColor} strokeWidth="14" strokeLinecap="round"
-            strokeDasharray={`${emotion.confidence*251.2} 251.2`}
-            style={{filter:`drop-shadow(0 0 8px ${domColor})`,transition:'stroke-dasharray .6s'}}/>
+            strokeDasharray={`${emotion.confidence * 251.2} 251.2`}
+            style={{ filter: `drop-shadow(0 0 8px ${domColor})`, transition: 'stroke-dasharray .6s' }}/>
           <g transform={`rotate(${needle},100,100)`}>
             <line x1="100" y1="100" x2="100" y2="32"
               stroke="white" strokeWidth="2.5" strokeLinecap="round"/>
@@ -578,20 +692,20 @@ function EmotionCard({ emotion }) {
 
       <div className="emo-bars">
         {EMOS.map(em => {
-          const sc = scores[em]||0;
-          const col = EMOTION_COLORS[em];
+          const sc    = scores[em] || 0;
+          const col   = EMOTION_COLORS[em];
           const active = em === emotion.emotion?.toLowerCase();
           return (
-            <div key={em} className={`emo-row ${active?'emo-row-active':''}`}>
+            <div key={em} className={`emo-row ${active ? 'emo-row-active' : ''}`}>
               <span className="emo-lbl">{EMOTION_ICONS[em]} {em}</span>
               <div className="emo-track">
                 <div className="emo-fill" style={{
-                  width:`${sc*100}%`, background:col,
-                  boxShadow: active?`0 0 10px ${col}`:''
+                  width: `${sc * 100}%`, background: col,
+                  boxShadow: active ? `0 0 10px ${col}` : ''
                 }}/>
               </div>
-              <span className="emo-pct" style={{color:active?col:undefined}}>
-                {(sc*100).toFixed(0)}%
+              <span className="emo-pct" style={{ color: active ? col : undefined }}>
+                {(sc * 100).toFixed(0)}%
               </span>
             </div>
           );
