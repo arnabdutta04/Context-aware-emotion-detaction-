@@ -1,0 +1,39 @@
+# Python environments
+.venv/
+.venv311/
+venv/
+myenv/
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# ML / Large files (IMPORTANT)
+trained_models/
+models/
+data/
+datasets/
+*.pt
+*.h5
+*.pkl
+*.joblib
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Cache
+.cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
